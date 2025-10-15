@@ -137,6 +137,9 @@ func (n *Node) aggregateResponses(reqId string) {
 	n.Logger.Println("estimated count", result.Count)
 	n.Logger.Println("estimated avg", result.Avg)
 	for _, peer := range n.Hyparview.GetPeers(1000) {
+		if rand.Float64() < 0.5 {
+			continue
+		}
 		err := peer.Conn.Send(data.Message{
 			Type:    RR_RESULT_MSG_TYPE,
 			Payload: result,
@@ -238,6 +241,9 @@ func (n *Node) onResult(msg RRResult) {
 		Payload: msg,
 	}
 	for _, peer := range n.Hyparview.GetPeers(1000) {
+		if rand.Float64() < 0.5 {
+			continue
+		}
 		err := peer.Conn.Send(forward)
 		if err != nil {
 			n.Logger.Println(err)
