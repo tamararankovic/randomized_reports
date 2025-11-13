@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,26 +15,54 @@ import (
 	"sync"
 	"time"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
-	"github.com/c12s/hyparview/transport"
-	"github.com/caarlos0/env"
 	"github.com/gofrs/uuid"
+	"github.com/tamararankovic/randomized_reports/config"
+	"github.com/tamararankovic/randomized_reports/peers"
 )
 
-const RR_REQ_MSG_TYPE data.MessageType = data.UNKNOWN + 1
-const RR_RESP_MSG_TYPE data.MessageType = data.UNKNOWN + 2
-const RR_RESULT_MSG_TYPE data.MessageType = data.UNKNOWN + 3
+const RR_REQ_MSG_TYPE int8 = 1
+const RR_RESP_MSG_TYPE int8 = 2
+const RR_RESULT_MSG_TYPE int8 = 3
 
-var root transport.Conn
+var root *peers.Peer
 
-// var estimatedAvg = 0.0
+type Msg interface {
+	Type() int8
+}
+
+func MsgToBytes(msg Msg) []byte {
+	msgBytes, _ := json.Marshal(&msg)
+	return append([]byte{byte(msg.Type())}, msgBytes...)
+}
+
+func BytesToMsg(msgBytes []byte) Msg {
+	msgType := int8(msgBytes[0])
+	var msg Msg
+	switch msgType {
+	case RR_REQ_MSG_TYPE:
+		msg = &RRRequest{}
+	case RR_RESP_MSG_TYPE:
+		msg = &RRResponse{}
+	case RR_RESULT_MSG_TYPE:
+		msg = &RRResult{}
+	}
+	if msg == nil {
+		return nil
+	}
+	json.Unmarshal(msgBytes[1:], msg)
+	return msg
+}
 
 type RRRequest struct {
 	ReqID           string
 	RespProbability float64
-	RespAddr        string
+	RespIP          string
+	RespPort        int
 	ReqTime         int64
+}
+
+func (m RRRequest) Type() int8 {
+	return RR_REQ_MSG_TYPE
 }
 
 type RRResponse struct {
@@ -44,13 +73,23 @@ type RRResponse struct {
 	Value           float64
 }
 
+func (m RRResponse) Type() int8 {
+	return RR_RESP_MSG_TYPE
+}
+
 type RRResult struct {
 	Time            int64
 	Sum, Count, Avg float64
 }
 
+func (m RRResult) Type() int8 {
+	return RR_RESULT_MSG_TYPE
+}
+
 type Node struct {
 	ID                string
+	IP                string
+	Port              int
 	TAgg              int
 	Value             float64
 	RespProbability   float64
@@ -62,9 +101,8 @@ type Node struct {
 	EpochLength       int
 	FirstRoundWaitSec int
 	LastResult        RRResult
-	Hyparview         *hyparview.HyParView
+	Peers             *peers.Peers
 	Lock              *sync.Mutex
-	Logger            *log.Logger
 }
 
 func (n *Node) sendRquests() {
@@ -79,20 +117,15 @@ func (n *Node) sendRquests() {
 		}
 		req := RRRequest{
 			ReqID:           reqId,
-			RespAddr:        n.Hyparview.Self().ListenAddress,
+			RespIP:          n.IP,
+			RespPort:        n.Port,
 			RespProbability: n.RespProbability,
 			ReqTime:         time.Now().UnixNano(),
 		}
-		msg := data.Message{
-			Type:    RR_REQ_MSG_TYPE,
-			Payload: req,
-		}
+		msg := MsgToBytes(req)
 		n.Lock.Lock()
-		for _, peer := range n.Hyparview.GetPeers(1000) {
-			err := peer.Conn.Send(msg)
-			if err != nil {
-				log.Println(err)
-			}
+		for _, peer := range n.Peers.GetPeers() {
+			peer.Send(msg)
 		}
 		wait := n.WaitRespNs
 		if n.Iteration%n.EpochLength == 0 {
@@ -122,7 +155,7 @@ func (n *Node) aggregateResponses(reqId string) {
 	delete(n.LastResp, reqId)
 	if n.WaitRespNs < int(timeElapsed) {
 		n.WaitRespNs = int(timeElapsed)
-		n.Logger.Println("new wait", n.WaitRespNs)
+		log.Println("new wait", n.WaitRespNs)
 	}
 	result := RRResult{
 		Time:  time.Now().UnixNano(),
@@ -130,28 +163,22 @@ func (n *Node) aggregateResponses(reqId string) {
 		Count: count / probability,
 	}
 	if result.Count > 0 {
-		result.Avg = result.Sum / result.Count / probability
+		result.Avg = result.Sum / result.Count
 	}
 	n.LastResult = result
-	n.Logger.Println("estimated sum", result.Sum)
-	n.Logger.Println("estimated count", result.Count)
-	n.Logger.Println("estimated avg", result.Avg)
-	for _, peer := range n.Hyparview.GetPeers(1000) {
+	log.Println("estimated sum", result.Sum)
+	log.Println("estimated count", result.Count)
+	log.Println("estimated avg", result.Avg)
+	msg := MsgToBytes(result)
+	for _, peer := range n.Peers.GetPeers() {
 		if rand.Float64() < 0.5 {
 			continue
 		}
-		err := peer.Conn.Send(data.Message{
-			Type:    RR_RESULT_MSG_TYPE,
-			Payload: result,
-		})
-		if err != nil {
-			n.Logger.Println(err)
-		}
+		peer.Send(msg)
 	}
 }
 
-func (n *Node) onReq(req RRRequest) {
-	// n.Logger.Println("received req", req)
+func (n *Node) onReq(req *RRRequest) {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
 	if slices.ContainsFunc(n.ProcessedRequests, func(id string) bool {
@@ -159,15 +186,9 @@ func (n *Node) onReq(req RRRequest) {
 	}) {
 		return
 	}
-	forward := data.Message{
-		Type:    RR_REQ_MSG_TYPE,
-		Payload: req,
-	}
-	for _, peer := range n.Hyparview.GetPeers(1000) {
-		err := peer.Conn.Send(forward)
-		if err != nil {
-			log.Println(err)
-		}
+	forward := MsgToBytes(req)
+	for _, peer := range n.Peers.GetPeers() {
+		peer.Send(forward)
 	}
 	n.ProcessedRequests = append(n.ProcessedRequests, req.ReqID)
 	if rand.Float64() > req.RespProbability {
@@ -180,37 +201,18 @@ func (n *Node) onReq(req RRRequest) {
 		ReqTime:         req.ReqTime,
 		Value:           n.Value,
 	}
-	msg := data.Message{
-		Type:    RR_RESP_MSG_TYPE,
-		Payload: resp,
-	}
-	// n.Logger.Println("sending resp", resp)
-	var conn transport.Conn
+	msg := MsgToBytes(resp)
+	var conn *peers.Peer
 	if root != nil {
 		conn = root
 	} else {
-		var err error
-		conn, err = transport.NewTCPConn(req.RespAddr, n.Logger)
-		if err != nil {
-			log.Println(err)
-		} else {
-			root = conn
-		}
+		conn = n.Peers.NewPeer("root", req.RespIP, req.RespPort)
+		root = conn
 	}
-	if conn == nil {
-		return
-	}
-	err := conn.Send(msg)
-	if err != nil {
-		log.Println(err)
-		root = nil
-	} else {
-		// n.Logger.Println("resp sent", resp)
-	}
+	conn.Send(msg)
 }
 
-func (n *Node) onResp(resp RRResponse) {
-	// n.Logger.Println("received resp", resp)
+func (n *Node) onResp(resp *RRResponse) {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
 	responses := n.Responses[resp.ReqID]
@@ -219,119 +221,94 @@ func (n *Node) onResp(resp RRResponse) {
 	}) {
 		return
 	}
-	responses = append(responses, resp)
+	responses = append(responses, *resp)
 	n.Responses[resp.ReqID] = responses
 	n.LastResp[resp.ReqID] = time.Now().UnixNano() - resp.ReqTime
 }
 
-func (n *Node) onResult(msg RRResult) {
-	// n.Logger.Println("received resp", resp)
+func (n *Node) onResult(msg *RRResult) {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
 	if msg.Time <= n.LastResult.Time {
 		// already seen
 		return
 	}
-	n.LastResult = msg
-	n.Logger.Println("estimated sum", n.LastResult.Sum)
-	n.Logger.Println("estimated count", n.LastResult.Count)
-	n.Logger.Println("estimated avg", n.LastResult.Avg)
-	forward := data.Message{
-		Type:    RR_RESULT_MSG_TYPE,
-		Payload: msg,
-	}
-	for _, peer := range n.Hyparview.GetPeers(1000) {
+	n.LastResult = *msg
+	log.Println("estimated sum", n.LastResult.Sum)
+	log.Println("estimated count", n.LastResult.Count)
+	log.Println("estimated avg", n.LastResult.Avg)
+	forward := MsgToBytes(msg)
+	for _, peer := range n.Peers.GetPeers() {
 		if rand.Float64() < 0.5 {
 			continue
 		}
-		err := peer.Conn.Send(forward)
-		if err != nil {
-			n.Logger.Println(err)
-		}
+		peer.Send(forward)
 	}
 }
 
 func main() {
-	hvConfig := hyparview.Config{}
-	err := env.Parse(&hvConfig)
+	time.Sleep(10 * time.Second)
+
+	cfg := config.LoadConfigFromEnv()
+	params := config.LoadParamsFromEnv()
+
+	ps, err := peers.NewPeers(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	cfg := Config{}
-	err = env.Parse(&cfg)
+	val, err := strconv.Atoi(params.ID)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	self := data.Node{
-		ID:            cfg.NodeID,
-		ListenAddress: cfg.ListenAddr,
-	}
-
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
-
-	gnConnManager := transport.NewConnManager(
-		transport.NewTCPConn,
-		transport.AcceptTcpConnsFn(self.ListenAddress),
-	)
-
-	hv, err := hyparview.NewHyParView(hvConfig, self, gnConnManager, logger)
-	if err != nil {
-		log.Fatal(err)
-	}
-	hv.AllowAny = true
-
-	tAgg, err := strconv.Atoi(cfg.TAgg)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
-	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	if err != nil {
-		logger.Fatal(err)
 	}
 
 	node := &Node{
-		ID:                cfg.NodeID,
-		TAgg:              tAgg,
+		ID:                params.ID,
+		IP:                cfg.ListenIP,
+		Port:              cfg.ListenPort,
+		TAgg:              params.Tagg,
 		Value:             float64(val),
-		RespProbability:   cfg.RespProbability,
+		RespProbability:   params.RespProbability,
 		Responses:         make(map[string][]RRResponse),
 		LastResp:          make(map[string]int64),
-		EpochLength:       cfg.EpochLength,
-		FirstRoundWaitSec: cfg.FirstRoundWaitSec,
-		Hyparview:         hv,
+		EpochLength:       params.EpochLength,
+		FirstRoundWaitSec: params.FirstRoundWaitSec,
+		Peers:             ps,
 		Lock:              &sync.Mutex{},
-		Logger:            logger,
 	}
-	hv.AddClientMsgHandler(RR_REQ_MSG_TYPE, func(msgBytes []byte, peer hyparview.Peer) {
-		msg := RRRequest{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
+
+	lastRcvd := make(map[string]int)
+	round := 0
+
+	// handle messages
+	go func() {
+		for msgRcvd := range ps.Messages {
+			msg := BytesToMsg(msgRcvd.MsgBytes)
+			if msg == nil {
+				continue
+			}
+			switch msg.Type() {
+			case RR_REQ_MSG_TYPE:
+				node.onReq(msg.(*RRRequest))
+			case RR_RESP_MSG_TYPE:
+				node.onResp(msg.(*RRResponse))
+			case RR_RESULT_MSG_TYPE:
+				node.onResult(msg.(*RRResult))
+			}
 		}
-		node.onReq(msg)
-	})
-	hv.AddClientMsgHandler(RR_RESP_MSG_TYPE, func(msgBytes []byte, _ hyparview.Peer) {
-		msg := RRResponse{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
+	}()
+
+	// remove failed peers
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			round++
+			for _, peer := range ps.GetPeers() {
+				if lastRcvd[peer.GetID()]+params.Rmax < round && round > 10 {
+					ps.PeerFailed(peer.GetID())
+				}
+			}
 		}
-		node.onResp(msg)
-	})
-	hv.AddClientMsgHandler(RR_RESULT_MSG_TYPE, func(msgBytes []byte, _ hyparview.Peer) {
-		msg := RRResult{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
-		}
-		node.onResult(msg)
-	})
+	}()
 
 	go func() {
 		for range time.NewTicker(time.Second).C {
@@ -343,12 +320,7 @@ func main() {
 		}
 	}()
 
-	err = hv.Join(cfg.ContactID, cfg.ContactAddr)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
-	if node.ID == "r1_node_1" {
+	if node.ID == "1" {
 		go node.sendRquests()
 	}
 
@@ -356,14 +328,7 @@ func main() {
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening")
 
-	go func() {
-		log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
-	}()
-
-	r2 := http.NewServeMux()
-	r2.HandleFunc("GET /state", node.StateHandler)
-	log.Println("State server listening on :5001/state")
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 }
 
 func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -383,9 +348,9 @@ func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	val, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	} else {
-		n.Logger.Println("new value", val)
+		log.Println("new value", val)
 		n.Value = val
 	}
 	w.WriteHeader(http.StatusOK)
@@ -395,13 +360,13 @@ var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	name := "value"
-	filename := fmt.Sprintf("/var/log/monoceros/results/%s.csv", name)
+	filename := fmt.Sprintf("/var/log/rand_reports/%s.csv", name)
 	// defer file.Close()
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -413,18 +378,18 @@ func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	valStr := strconv.FormatFloat(value, 'f', -1, 64)
 	err := writer.Write([]string{"x", reqTsStr, rcvTsStr, valStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
 
 func (n *Node) exportMsgCount() {
-	filename := "/var/log/monoceros/results/msg_count.csv"
+	filename := "/var/log/rand_reports/msg_count.csv"
 	// defer file.Close()
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -432,16 +397,16 @@ func (n *Node) exportMsgCount() {
 	}
 	defer writer.Flush()
 	tsStr := strconv.Itoa(int(time.Now().UnixNano()))
-	transport.MessagesSentLock.Lock()
-	sent := transport.MessagesSent - transport.MessagesSentSub
-	transport.MessagesSentLock.Unlock()
-	transport.MessagesRcvdLock.Lock()
-	rcvd := transport.MessagesRcvd - transport.MessagesRcvdSub
-	transport.MessagesRcvdLock.Unlock()
+	peers.MessagesSentLock.Lock()
+	sent := peers.MessagesSent
+	peers.MessagesSentLock.Unlock()
+	peers.MessagesRcvdLock.Lock()
+	rcvd := peers.MessagesRcvd
+	peers.MessagesRcvdLock.Unlock()
 	sentStr := strconv.Itoa(sent)
 	rcvdStr := strconv.Itoa(rcvd)
 	err := writer.Write([]string{tsStr, sentStr, rcvdStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
